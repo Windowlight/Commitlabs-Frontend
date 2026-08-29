@@ -31,6 +31,7 @@ export const CacheKey = {
     `commitlabs:marketplace:listings:${queryHash}`,
   commitmentSearch: (queryHash: string) =>
     `commitlabs:commitment-search:${queryHash}`,
+  marketplaceStats: () => `commitlabs:marketplace:stats`,
 } as const;
 
 /** TTL in seconds — keep short so stale chain data doesn't linger. */
@@ -40,4 +41,8 @@ export const CacheTTL = {
   MARKETPLACE_LISTINGS: 15,
   /** Short TTL for search results — keeps filters responsive while avoiding stale data. */
   COMMITMENT_SEARCH: 15,
+  /** Marketplace aggregate statistics — 30 seconds for freshness */
+  MARKETPLACE_STATS: 30,
+  /** Empty marketplace stats (no listings) — cache longer since unlikely to change */
+  MARKETPLACE_STATS_EMPTY: 60,
 } as const;
