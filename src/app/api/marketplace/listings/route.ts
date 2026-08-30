@@ -1,9 +1,18 @@
-import { NextRequest } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { ok, methodNotAllowed } from '@/lib/backend/apiResponse';
+import { isFeatureEnabled } from '@/lib/backend/config';
+import { assertMutationCsrf } from '@/lib/backend/csrf';
 import { createCorsOptionsHandler, type CorsRoutePolicy } from '@/lib/backend/cors';
 import { TooManyRequestsError, ValidationError } from '@/lib/backend/errors';
+import { getClientIp } from '@/lib/backend/getClientIp';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { parseJsonWithLimit, JSON_BODY_LIMITS } from '@/lib/backend/jsonBodyLimit';
-import { checkRateLimit } from '@/lib/backend/rateLimit';
+import {
+  assertWalletMatchesSession,
+  MarketplaceCreateListingBoundarySchema,
+} from '@/lib/backend/marketplaceBoundary';
+import { checkRateLimit, getRateLimitWindowSeconds } from '@/lib/backend/rateLimit';
+import { verifyAuth } from '@/lib/backend/requireAuth';
 import {
   getMarketplaceSortKeys,
   isMarketplaceSortBy,
@@ -13,9 +22,13 @@ import {
   type MarketplacePublicListing,
 } from '@/lib/backend/services/marketplace';
 import { withApiHandler } from '@/lib/backend/withApiHandler';
-import type { CreateListingRequest, CreateListingResponse } from '@/types/marketplace';
+import type { CreateListingResponse } from '@/types/marketplace';
 
-const COMMITMENT_TYPES: readonly MarketplaceCommitmentType[] = ['Safe', 'Balanced', 'Aggressive'] as const;
+const COMMITMENT_TYPES: readonly MarketplaceCommitmentType[] = [
+  'Safe',
+  'Balanced',
+  'Aggressive',
+] as const;
 
 interface ParseResult {
   type?: MarketplaceCommitmentType;
@@ -80,7 +93,9 @@ function parseType(searchParams: URLSearchParams): MarketplaceCommitmentType | u
   };
 
   if (!(normalized in mapping)) {
-    throw new ValidationError(`Invalid 'type' query param. Allowed values: ${COMMITMENT_TYPES.join(', ')}.`);
+    throw new ValidationError(
+      `Invalid 'type' query param. Allowed values: ${COMMITMENT_TYPES.join(', ')}.`,
+    );
   }
 
   return mapping[normalized];
@@ -90,56 +105,150 @@ function parseQuery(searchParams: URLSearchParams): ParseResult {
   const minAmount = parseNumber(searchParams, 'minAmount');
   const maxAmount = parseNumber(searchParams, 'maxAmount');
   if (minAmount !== undefined && maxAmount !== undefined && minAmount > maxAmount) {
-    throw new ValidationError("Invalid amount filter. 'minAmount' cannot be greater than 'maxAmount'.");
+    throw new ValidationError(
+      "Invalid amount filter. 'minAmount' cannot be greater than 'maxAmount'.",
+    );
   }
 
   const sortBy = searchParams.get('sortBy') ?? undefined;
   if (sortBy && !isMarketplaceSortBy(sortBy)) {
-    throw new ValidationError(`Invalid 'sortBy' query param. Allowed values: ${getMarketplaceSortKeys().join(', ')}.`);
+    throw new ValidationError(
+      `Invalid 'sortBy' query param. Allowed values: ${getMarketplaceSortKeys().join(', ')}.`,
+    );
   }
 
-  return {
-    type: parseType(searchParams),
-    minCompliance: parseNumber(searchParams, 'minCompliance'),
-    maxLoss: parseNumber(searchParams, 'maxLoss'),
-    minAmount,
-    maxAmount,
-    sortBy,
+  const type = parseType(searchParams);
+  const minCompliance = parseNumber(searchParams, 'minCompliance');
+  const maxLoss = parseNumber(searchParams, 'maxLoss');
+  const result: ParseResult = {
     page: parseInteger(searchParams, 'page', 1),
     pageSize: parseInteger(searchParams, 'pageSize', 10),
   };
+
+  if (type !== undefined) result.type = type;
+  if (minCompliance !== undefined) result.minCompliance = minCompliance;
+  if (maxLoss !== undefined) result.maxLoss = maxLoss;
+  if (minAmount !== undefined) result.minAmount = minAmount;
+  if (maxAmount !== undefined) result.maxAmount = maxAmount;
+  if (sortBy !== undefined) result.sortBy = sortBy;
+
+  return result;
 }
 
-export const GET = withApiHandler(async (req: NextRequest, _context, correlationId) => {
-  if (!(await checkRateLimit('anonymous', 'api/marketplace/listings'))) {
-    throw new TooManyRequestsError();
-  }
+export const GET = withApiHandler(
+  async (req: NextRequest, _context, correlationId) => {
+    if (!isFeatureEnabled('marketplace')) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Marketplace feature is disabled.',
+            details: { feature: 'marketplace' },
+          },
+        },
+        { status: 404 },
+      );
+    }
 
-  const { searchParams } = new URL(req.url);
-  const filters = parseQuery(searchParams);
-  const listings = await listMarketplaceListings(filters);
+    const ip = getClientIp(req);
+    if (!(await checkRateLimit(ip, 'api/marketplace/listings'))) {
+      throw new TooManyRequestsError();
+    }
 
-  return ok({
-    listings,
-    cards: listings.map(toMarketplaceCard),
-    total: listings.length,
-  }, undefined, 200, correlationId);
-}, { cors: MARKETPLACE_LISTINGS_CORS_POLICY, enableETag: true });
+    const { searchParams } = new URL(req.url);
+    const filters = parseQuery(searchParams);
+    const listings = await listMarketplaceListings(filters);
 
-export const POST = withApiHandler(async (req: NextRequest, _context, correlationId) => {
-  const body = await parseJsonWithLimit(req, {
-    limitBytes: JSON_BODY_LIMITS.marketplaceListingsCreate,
-  });
+    return ok(
+      {
+        listings,
+        cards: listings.map(toMarketplaceCard),
+        total: listings.length,
+      },
+      undefined,
+      200,
+      correlationId,
+    );
+  },
+  { cors: MARKETPLACE_LISTINGS_CORS_POLICY, enableETag: true },
+);
 
-  if (!body || typeof body !== 'object') {
-    throw new ValidationError('Request body must be an object');
-  }
+export const POST = withApiHandler(
+  async (req: NextRequest, _context, correlationId) => {
+    if (!isFeatureEnabled('marketplace')) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Marketplace feature is disabled.',
+            details: { feature: 'marketplace' },
+          },
+        },
+        { status: 404 },
+      );
+    }
 
-  const request = body as CreateListingRequest;
-  const listing = await marketplaceService.createListing(request);
-  const response: CreateListingResponse = { listing };
-  return ok(response, undefined, 201, correlationId);
-}, { cors: MARKETPLACE_LISTINGS_CORS_POLICY });
+    assertMutationCsrf(req);
+
+    const ip = getClientIp(req);
+    if (!(await checkRateLimit(ip, 'api/marketplace/listings/create'))) {
+      throw new TooManyRequestsError(
+        'Too many requests. Please try again later.',
+        undefined,
+        getRateLimitWindowSeconds('api/marketplace/listings/create'),
+      );
+    }
+
+    const idempotencyKey = req.headers.get('idempotency-key');
+    if (idempotencyKey) {
+      const record = await idempotencyService.getRecord(idempotencyKey);
+      if (record) {
+        if (record.status === 'COMPLETED') {
+          return ok(
+            record.response as CreateListingResponse,
+            undefined,
+            record.statusCode,
+            correlationId,
+          );
+        }
+        if (record.status === 'STARTED') {
+          throw new TooManyRequestsError(
+            'A request with this Idempotency-Key is currently processing.',
+            undefined,
+            getRateLimitWindowSeconds('api/marketplace/listings/create'),
+          );
+        }
+      }
+      await idempotencyService.start(idempotencyKey);
+    }
+
+    try {
+      const body = await parseJsonWithLimit(req, {
+        limitBytes: JSON_BODY_LIMITS.marketplaceListingsCreate,
+      });
+
+      if (!body || typeof body !== 'object') {
+        throw new ValidationError('Request body must be an object');
+      }
+
+      const request = body as CreateListingRequest;
+      const listing = await marketplaceService.createListing(request);
+      const response: CreateListingResponse = { listing };
+
+      if (idempotencyKey) {
+        await idempotencyService.complete(idempotencyKey, response, 201);
+      }
+
+      return ok(response, undefined, 201, correlationId);
+    } catch (error) {
+      if (idempotencyKey) {
+        await idempotencyService.fail(idempotencyKey);
+      }
+      throw error;
+    }
+  },
+  { cors: MARKETPLACE_LISTINGS_CORS_POLICY },
+);
 
 const _405 = methodNotAllowed(['GET', 'POST']);
 export { _405 as PUT, _405 as PATCH, _405 as DELETE };

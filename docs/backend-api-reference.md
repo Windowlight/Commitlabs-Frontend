@@ -7,6 +7,38 @@ base; they exist primarily for analytics hooks and development/testing.
 Each entry includes the HTTP method, path, expected request body (if any), and
 an example response. All endpoints return JSON.
 
+## OpenAPI Spec & CI
+
+The machine-readable API contract lives in [`openapi.yaml`](../openapi.yaml) at
+the repo root. CI enforces two checks on every PR:
+
+1. **Spec validity** — `validate-openapi.sh` runs Redocly lint against
+   `openapi.yaml` and fails on schema or structural errors.
+2. **Route coverage** — `scripts/check-route-coverage.sh` discovers every
+   `src/app/api/**/route.ts` file, maps it to an `/api/...` path (dynamic
+   segments become `{param}`), and fails if that path is absent from
+   `openapi.yaml`.
+
+### Adding a new API route
+
+When you add `src/app/api/<segments>/route.ts`:
+
+1. Add a matching path entry under `paths:` in `openapi.yaml` (use `{id}` for
+   dynamic segments, e.g. `src/app/api/foo/[id]/bar` → `/api/foo/{id}/bar`).
+2. Run locally before pushing:
+
+   ```bash
+   bash validate-openapi.sh
+   bash scripts/check-route-coverage.sh
+   ```
+
+3. Update this document with request/response examples if the endpoint is
+   user-facing.
+
+Undocumented routes block merge until the spec is updated.
+
+---
+
 ## CORS Summary
 
 - Public browser routes return wildcard CORS without credentials.
@@ -64,6 +96,44 @@ Clients should wait the indicated seconds before retrying. See [error-handling.m
 
 ---
 
+## `GET /api/marketplace/listings/[id]`
+
+Fetches a single marketplace listing by its listing ID. This endpoint is used by
+`/marketplace/[id]` to render deep-linkable listing detail pages.
+
+- **Authentication**: none
+- **Path parameter**: `id` — the marketplace listing ID
+- **Response**:
+  - `200 OK`: Listing returned.
+  - `404 Not Found`: Listing does not exist.
+
+### Example
+
+```bash
+curl -X GET http://localhost:3000/api/marketplace/listings/LST-001
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "listing": {
+      "listingId": "LST-001",
+      "commitmentId": "CMT-001",
+      "type": "Safe",
+      "amount": 50000,
+      "remainingDays": 25,
+      "maxLoss": 2,
+      "currentYield": 5.2,
+      "complianceScore": 95,
+      "price": 52000
+    }
+  }
+}
+```
+
+---
+
 ## `POST /api/marketplace/listings/[id]/purchase`
 
 Purchases a marketplace listing. Requires an active session cookie. Runs
@@ -104,49 +174,59 @@ curl -X POST http://localhost:3000/api/marketplace/listings/listing_1/purchase \
 
 ---
 
-## `POST /api/commitments`
+## `GET /api/admin/audit-events`
 
-Creates a new commitment on the Stellar network.
+Retrieves recent audit events for admin investigation and allows optional
+filtering by actor, event type, and time window.
 
-- **Headers**:
-  - `Idempotency-Key`: (Optional) A unique string to identify the request and prevent duplicate processing. Recommended for safe retries.
-- **Request body**:
-  - `ownerAddress`: (string, required) The Stellar address of the owner.
-  - `asset`: (string, required) The asset code.
-  - `amount`: (string, required) The amount to commit.
-  - `durationDays`: (number, required) The duration of the commitment in days.
-  - `maxLossBps`: (number, required) Maximum loss in basis points.
-  - `metadata`: (object, optional) Additional metadata.
+- **Authentication**: admin bearer token (`Authorization: Bearer <COMMITLABS_ADMIN_SECRET>`)
+- **Query parameters**:
+  - `limit` (number, optional) — maximum events to return, 1–200. Defaults to 50.
+  - `actor` (string, optional) — exact actor address to match.
+  - `type` (string, optional) — audit event action, e.g. `commitment.created`.
+  - `startTime` (string, optional) — ISO 8601 lower bound (inclusive).
+  - `endTime` (string, optional) — ISO 8601 upper bound (inclusive).
 - **Response**:
-  - `201 Created`: The commitment was successfully created.
-  - `409 Conflict`: A request with the same `Idempotency-Key` is already in progress.
+  - `200 OK`: Events returned.
+  - `400 Validation Error`: Invalid filter or pagination parameters.
+  - `403 Forbidden`: Feature disabled or invalid admin token.
   - `429 Too Many Requests`: Rate limit exceeded.
 
 ### Example
 
 ```bash
-curl -X POST http://localhost:3000/api/commitments \
-     -H 'Content-Type: application/json' \
-     -d '{"asset":"XLM","amount":100}'
+curl -X GET 'http://localhost:3000/api/admin/audit-events?actor=0xdeadbeef&type=attestation.recorded&startTime=2026-04-01T00:00:00Z&endTime=2026-04-30T23:59:59Z' \
+     -H 'Authorization: Bearer <COMMITLABS_ADMIN_SECRET>'
 ```
 
 ```json
 {
-  "message": "Commitments creation endpoint stub - rate limiting applied",
-  "ip": "::1"
+  "success": true,
+  "data": {
+    "events": [
+      {
+        "id": "evt-002",
+        "timestamp": "2026-04-23T12:00:00Z",
+        "category": "attestation",
+        "action": "attestation.recorded",
+        "severity": "info",
+        "actor": "[REDACTED]",
+        "ip": "[REDACTED]",
+        "resourceId": "ATT-002"
+      }
+    ],
+    "total": 1
+  },
+  "meta": {
+    "limit": 50
+  }
 }
 ```
 
 ---
 
-## `POST /api/commitments/[id]/settle`
-
-Marks the commitment identified by `id` as settled. Currently a stub that emits
-`CommitmentSettled` events.
-
-- **Path parameter**: `id` (string)
-- **Headers**:
     - `Idempotency-Key`: (Optional) A unique string to identify the request and prevent duplicate processing. Replayed requests within the 24-hour replay window return the original prior result.
+
 - **Request body**: optional JSON payload with additional details.
 - **Response**: stub confirmation message.
 
@@ -167,15 +247,68 @@ curl -X POST http://localhost:3000/api/commitments/abc123/settle \
 
 ---
 
+## `GET /api/commitments/[id]/settle/preview`
+
+Returns a preview of whether a commitment is eligible for settlement and an estimated settlement amount. Reuses the maturity and status checks from the settlement logic without mutating chain state.
+
+- **Path parameter**: `id` (string) — The commitment ID to preview settlement for.
+- **Query parameters**: none.
+- **Response**:
+  - `200 OK`: Settlement preview completed. Returns the eligibility status and estimated settlement value.
+  - `404 Not Found`: Commitment does not exist.
+  - `429 Too Many Requests`: Rate limit exceeded.
+
+### Example
+
+```bash
+curl -X GET http://localhost:3000/api/commitments/abc123/settle/preview
+```
+
+```json
+{
+  "success": true,
+  "data": {
+    "eligible": true,
+    "reason": null,
+    "estimatedSettlement": "1000.50",
+    "criteria": {
+      "maturity": true,
+      "noDispute": true,
+      "eligibleState": true
+    }
+  }
+}
+```
+
+If the commitment is not eligible:
+
+```json
+{
+  "success": true,
+  "data": {
+    "eligible": false,
+    "reason": "Commitment has not matured yet and cannot be settled.",
+    "estimatedSettlement": "1000.50",
+    "criteria": {
+      "maturity": false,
+      "noDispute": true,
+      "eligibleState": true
+    }
+  }
+}
+```
+
+---
+
 ## `POST /api/commitments/[id]/fund`
 
 Funds an existing commitment that was previously created but not yet funded. The route validates ownership, enforces `CREATED` state, and submits the on-chain `fund_escrow` transaction.
 
 - **Path parameter**: `id` (string)
 - **Headers**:
-    - `Idempotency-Key`: (Optional) A unique string to identify the request and prevent duplicate processing. Replayed requests within the 24-hour replay window return the original prior result.
+  - `Idempotency-Key`: (Optional) A unique string to identify the request and prevent duplicate processing. Replayed requests within the 24-hour replay window return the original prior result.
 - **Request body**:
-    - `callerAddress` (string, optional) — Stellar address of the funding wallet. If omitted, the commitment owner is used.
+  - `callerAddress` (string, optional) — Stellar address of the funding wallet. If omitted, the commitment owner is used.
 - **Response**: confirmation of the funded commitment with `txHash` and `reference`.
 
 ### Example
@@ -222,11 +355,13 @@ applicable penalties.
 **Path parameter**: `id` (string) — The commitment ID to exit early.
 
 **Headers**:
+
 - `Idempotency-Key`: Optional. Replayed requests within the 24-hour replay window return the original prior result.
 - `Cookie`: Required session cookie with valid token.
 - `Content-Type`: `application/json`
 
 **Body Schema** (validated via Zod):
+
 ```typescript
 {
   reason: string; // Non-empty, max 500 characters (reason for early exit)
@@ -244,6 +379,7 @@ applicable penalties.
 ### Response
 
 **Success (200 OK)**:
+
 ```json
 {
   "success": true,
@@ -360,14 +496,14 @@ Returns the most recent attestations sorted by `observedAt` descending, with
 page-based pagination metadata.
 
 - **Query parameters**:
-    - `page`: (integer, optional) Page number (1-based). Must be ≥ 1. Defaults to 1.
-    - `pageSize`: (integer, optional) Items per page. Must be 1–100. Defaults to 10.
-    - `ownerAddress`: (string, optional) Filter by commitment owner address. Requires a valid `Authorization: Bearer <token>` header.
+  - `page`: (integer, optional) Page number (1-based). Must be ≥ 1. Defaults to 1.
+  - `pageSize`: (integer, optional) Items per page. Must be 1–100. Defaults to 10.
+  - `ownerAddress`: (string, optional) Filter by commitment owner address. Requires a valid `Authorization: Bearer <token>` header.
 - **Response**: `200 OK` with attestation list and pagination meta.
 - **Error codes**:
-    - `400 VALIDATION_ERROR` — `page` or `pageSize` out of range, or `ownerAddress` is blank.
-    - `401 UNAUTHORIZED` — `ownerAddress` provided without a valid Bearer token.
-    - `429 TOO_MANY_REQUESTS` — Rate limit exceeded.
+  - `400 VALIDATION_ERROR` — `page` or `pageSize` out of range, or `ownerAddress` is blank.
+  - `401 UNAUTHORIZED` — `ownerAddress` provided without a valid Bearer token.
+  - `429 TOO_MANY_REQUESTS` — Rate limit exceeded.
 
 ### Example
 
@@ -444,21 +580,21 @@ user preferences (the `notificationCategories` field) and updated via the
 `PUT /api/user/preferences` endpoint.
 
 - **Query parameters**:
-    - `ownerAddress`: (string, required) The Stellar address whose feed to return.
-    - `page`: (number, optional, default `1`) 1-indexed page number. Must be `>= 1`.
-    - `pageSize`: (number, optional, default `10`) Items per page. Must be `1`–`100`.
+  - `ownerAddress`: (string, required) The Stellar address whose feed to return.
+  - `page`: (number, optional, default `1`) 1-indexed page number. Must be `>= 1`.
+  - `pageSize`: (number, optional, default `10`) Items per page. Must be `1`–`100`.
 - **Preference filtering**:
-    - Notification categories the owner has set to `false` in
-      `notificationCategories` are excluded from the feed.
-    - When no preferences are stored, or a category key is absent, the category
-      is **delivered by default** (safe opt-in). An owner only stops receiving a
-      category by explicitly opting out.
-    - Filtering is applied **before pagination**, so `total` reflects the count
-      of notifications the owner can actually see — not the raw derived count.
+  - Notification categories the owner has set to `false` in
+    `notificationCategories` are excluded from the feed.
+  - When no preferences are stored, or a category key is absent, the category
+    is **delivered by default** (safe opt-in). An owner only stops receiving a
+    category by explicitly opting out.
+  - Filtering is applied **before pagination**, so `total` reflects the count
+    of notifications the owner can actually see — not the raw derived count.
 - **Response**:
-    - `200 OK`: Paginated, preference-filtered feed.
-    - `400 Bad Request`: `ownerAddress` is missing, or pagination params are out of range.
-    - `429 Too Many Requests`: Rate limit exceeded.
+  - `200 OK`: Paginated, preference-filtered feed.
+  - `400 Bad Request`: `ownerAddress` is missing, or pagination params are out of range.
+  - `429 Too Many Requests`: Rate limit exceeded.
 
 ### Example
 
@@ -523,17 +659,17 @@ curl http://localhost:3000/api/protocol/constants
 
 ## `POST /api/commitments/[id]/dispute`
 
-Opens a dispute for the named commitment.  Calls the escrow contract's
+Opens a dispute for the named commitment. Calls the escrow contract's
 `dispute` method and records an audit log event.
 
 - **Path parameter**: `id` (string) — the commitment ID
 - **Request body**:
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `reason` | string | Yes | Reason for the dispute (1–500 characters) |
-| `evidence` | string | No | Optional URL or reference to supporting evidence |
-| `callerAddress` | string | No | Stellar address of the caller (defaults to commitment owner) |
+| Field           | Type   | Required | Description                                                  |
+| --------------- | ------ | -------- | ------------------------------------------------------------ |
+| `reason`        | string | Yes      | Reason for the dispute (1–500 characters)                    |
+| `evidence`      | string | No       | Optional URL or reference to supporting evidence             |
+| `callerAddress` | string | No       | Stellar address of the caller (defaults to commitment owner) |
 
 - **Response**: dispute details including `disputeId`, `status`, and `txHash`.
 
@@ -560,11 +696,11 @@ curl -X POST http://localhost:3000/api/commitments/abc123/dispute \
 
 ### Error Responses
 
-| Status | Condition |
-|--------|-----------|
-| 400 | Missing or invalid `reason`, empty commitment ID |
-| 409 | Commitment already settled, exited, or already in dispute |
-| 502 | Blockchain call failed |
+| Status | Condition                                                 |
+| ------ | --------------------------------------------------------- |
+| 400    | Missing or invalid `reason`, empty commitment ID          |
+| 409    | Commitment already settled, exited, or already in dispute |
+| 502    | Blockchain call failed                                    |
 
 ---
 
@@ -572,17 +708,17 @@ curl -X POST http://localhost:3000/api/commitments/abc123/dispute \
 
 Resolves an open dispute on a commitment. **Admin access only** — the caller
 must authenticate with a valid Bearer token and the address must be listed in
-`ADMIN_ADDRESSES`.  Calls the escrow contract's `resolve_dispute` method and
+`ADMIN_ADDRESSES`. Calls the escrow contract's `resolve_dispute` method and
 records an audit log event.
 
 - **Path parameter**: `id` (string) — the commitment ID
 - **Authentication**: Bearer token required (admin only)
 - **Request body**:
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `resolution` | enum | Yes | One of: `resolved_in_favor_of_owner`, `resolved_in_favor_of_counterparty`, `dismissed` |
-| `notes` | string | No | Optional resolution notes (max 1000 characters) |
+| Field        | Type   | Required | Description                                                                            |
+| ------------ | ------ | -------- | -------------------------------------------------------------------------------------- |
+| `resolution` | enum   | Yes      | One of: `resolved_in_favor_of_owner`, `resolved_in_favor_of_counterparty`, `dismissed` |
+| `notes`      | string | No       | Optional resolution notes (max 1000 characters)                                        |
 
 - **Response**: resolution details including `disputeId`, `resolution`, and `finalStatus`.
 
@@ -611,25 +747,26 @@ curl -X POST http://localhost:3000/api/commitments/abc123/resolve \
 
 ### Error Responses
 
-| Status | Condition |
-|--------|-----------|
-| 400 | Missing or invalid `resolution`, empty commitment ID, notes too long |
-| 401 | Missing or invalid Bearer token |
-| 403 | Caller is not an admin |
-| 409 | Commitment is not currently in dispute |
-| 502 | Blockchain call failed |
+| Status | Condition                                                            |
+| ------ | -------------------------------------------------------------------- |
+| 400    | Missing or invalid `resolution`, empty commitment ID, notes too long |
+| 401    | Missing or invalid Bearer token                                      |
+| 403    | Caller is not an admin                                               |
+| 409    | Commitment is not currently in dispute                               |
+| 502    | Blockchain call failed                                               |
+
 ## `GET /api/commitments/[id]/events`
 
 Server-Sent Events (SSE) stream that pushes real-time commitment status updates and transitions (Active, Settled, Early Exit, Violated).
 
 - **Path parameter**: `id` (string)
 - **Headers**:
-    - `Accept`: `text/event-stream` (required)
+  - `Accept`: `text/event-stream` (required)
 - **Security**: Requires an authenticated session via browser cookies.
 - **Protocol Details**:
-    - **Snapshot**: The server emits a `snapshot` event immediately upon connection carrying the current status.
-    - **Transitions**: The server emits a `status_change` event only when a status transition is detected on-chain.
-    - **Heartbeat**: The server enqueues a comment heartbeat (`: keepalive`) every 20 seconds to prevent intermediates (proxies, load balancers) from dropping the idle connection.
+  - **Snapshot**: The server emits a `snapshot` event immediately upon connection carrying the current status.
+  - **Transitions**: The server emits a `status_change` event only when a status transition is detected on-chain.
+  - **Heartbeat**: The server enqueues a comment heartbeat (`: keepalive`) every 20 seconds to prevent intermediates (proxies, load balancers) from dropping the idle connection.
 
 ### Example Event Output
 

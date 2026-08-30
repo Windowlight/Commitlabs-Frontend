@@ -60,12 +60,10 @@ import {
 import { randomUUID } from 'crypto';
 
 const COMMITMENT_EARLY_EXIT_CORS_POLICY = {
-  POST: { access: "first-party" },
+  POST: { access: 'first-party' },
 } satisfies CorsRoutePolicy;
 
-export const OPTIONS = createCorsOptionsHandler(
-  COMMITMENT_EARLY_EXIT_CORS_POLICY,
-);
+export const OPTIONS = createCorsOptionsHandler(COMMITMENT_EARLY_EXIT_CORS_POLICY);
 
 function rethrowContractError(error: unknown): never {
   if (error instanceof BackendError) {
@@ -128,17 +126,76 @@ export const POST = withApiHandler(async (req: NextRequest, { params }, correlat
     // ─── Request Body Validation ──────────────────────────────────────────────
     let body: unknown;
     try {
-      body = await req.json();
-    } catch {
-      throw new ValidationError('Request body must be valid JSON');
-    }
+      // Authentication
+      const authReq = requireAuth(req);
+      const sessionAddress = authReq.user.address;
 
-    const parseResult = EarlyExitRequestBodySchema.safeParse(body);
-    if (!parseResult.success) {
-      throw new ValidationError('Invalid request body', {
-        errors: parseResult.error.flatten(),
+      // Request body validation
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        throw new ValidationError('Request body must be valid JSON');
+      }
+
+      const parseResult = EarlyExitRequestBodySchema.safeParse(body);
+      if (!parseResult.success) {
+        throw new ValidationError('Invalid request body', {
+          errors: parseResult.error.flatten(),
+        });
+      }
+
+      const { reason, callerAddress } = parseResult.data;
+      const commitmentId = params.id;
+
+      if (sessionAddress !== callerAddress) {
+        throw new ForbiddenError(
+          'You are not authorized to perform this action. Session address does not match caller address.',
+        );
+      }
+
+      const commitment = await getCommitmentFromChain(commitmentId).catch(rethrowContractError);
+
+      if (commitment.ownerAddress !== callerAddress) {
+        throw new ForbiddenError('You do not own this commitment and cannot exit it early.');
+      }
+
+      const result = await earlyExitCommitmentOnChain({
+        commitmentId,
+        callerAddress,
+      }).catch(rethrowContractError);
+
+      logEarlyExit({
+        ip,
+        commitmentId,
+        callerAddress,
+        reason,
+        exitAmount: result.exitAmount,
+        penaltyAmount: result.penaltyAmount,
       });
+
+      const responseData = {
+        exitAmount: result.exitAmount,
+        penaltyAmount: result.penaltyAmount,
+        finalStatus: result.finalStatus,
+        txHash: result.txHash,
+        reference: result.reference,
+      };
+
+      if (idempotencyKey) {
+        await idempotencyService.complete(idempotencyKey, responseData, 200);
+      }
+
+      return ok(responseData, undefined, 200, correlationId);
+    } catch (error) {
+      if (idempotencyKey) {
+        await idempotencyService.fail(idempotencyKey);
+      }
+      throw error;
     }
+  },
+  { cors: COMMITMENT_EARLY_EXIT_CORS_POLICY },
+);
 
     const { reason, callerAddress } = parseResult.data;
     const commitmentId = params.id;

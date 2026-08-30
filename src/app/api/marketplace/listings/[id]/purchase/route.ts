@@ -1,70 +1,154 @@
-import { NextRequest } from 'next/server';
-import { withApiHandler } from '@/lib/backend/withApiHandler';
-import { ok } from '@/lib/backend/apiResponse';
-import { requireAuth } from '@/lib/backend/requireAuth';
-import { marketplaceService } from '@/lib/backend/services/marketplace';
+import { NextRequest, NextResponse } from 'next/server';
+import { ok, methodNotAllowed } from '@/lib/backend/apiResponse';
+import { assertMutationCsrf } from '@/lib/backend/csrf';
+import { createCorsOptionsHandler, type CorsRoutePolicy } from '@/lib/backend/cors';
+import {
+  ConflictError,
+  ForbiddenError,
+  NotFoundError,
+  TooManyRequestsError,
+  ValidationError,
+} from '@/lib/backend/errors';
+import { getClientIp } from '@/lib/backend/getClientIp';
+import { idempotencyService } from '@/lib/backend/idempotency';
+import { isFeatureEnabled } from '@/lib/backend/config';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { transferOwnership } from '@/lib/backend/services/contracts';
-import { appendAuditEvent } from '@/lib/backend/auditLog';
-import { BadRequestError, ConflictError, NotFoundError } from '@/lib/backend/errors';
-import { logInfo } from '@/lib/backend/logger';
+import { marketplaceService } from '@/lib/backend/services/marketplace';
+import { checkRateLimit, getRateLimitWindowSeconds } from '@/lib/backend/rateLimit';
+import { verifyAuth } from '@/lib/backend/requireAuth';
+import { withApiHandler } from '@/lib/backend/withApiHandler';
 
-export const POST = withApiHandler(async (req: NextRequest, { params }: { params: { id: string } }) => {
-  const authReq = requireAuth(req);
-  const buyerAddress = authReq.user.address;
-  const listingId = params.id;
+const MARKETPLACE_PURCHASE_CORS_POLICY = {
+  POST: { access: 'first-party' },
+} satisfies CorsRoutePolicy;
 
-  if (!listingId) {
-    throw new BadRequestError('Missing listing ID');
+export const OPTIONS = createCorsOptionsHandler(MARKETPLACE_PURCHASE_CORS_POLICY);
+
+function getScopedIdempotencyKey(
+  req: NextRequest,
+  listingId: string,
+  buyerAddress: string,
+): string | null {
+  const raw = req.headers.get('idempotency-key');
+  if (!raw) return null;
+
+  const result = IdempotencyKeySchema.safeParse(raw);
+  if (!result.success) {
+    throw new ValidationError('Invalid Idempotency-Key header', result.error.issues);
   }
 
-  // 1. Load listing
-  const listing = await marketplaceService.getListing(listingId);
-  if (!listing) {
-    throw new NotFoundError('Listing', { listingId });
-  }
+  return `marketplace:purchase:${buyerAddress}:${listingId}:${result.data}`;
+}
 
-  // 2. Preflight eligibility check
-  const preflight = await marketplaceService.getPurchasePreflight(listingId, buyerAddress);
-  if (!preflight.eligible) {
-    throw new ConflictError(
-      `Purchase not eligible: ${preflight.reasons.join(', ')}`,
-      { listingId, reasons: preflight.reasons },
-    );
-  }
+export const POST = withApiHandler(
+  async (req: NextRequest, { params }, correlationId) => {
+    if (!isFeatureEnabled('marketplace')) {
+      return NextResponse.json(
+        {
+          error: {
+            code: 'NOT_FOUND',
+            message: 'Marketplace feature is disabled.',
+            details: { feature: 'marketplace' },
+          },
+        },
+        { status: 404 },
+      );
+    }
 
-  logInfo(req, 'Marketplace purchase initiated', { listingId, buyerAddress });
+    assertMutationCsrf(req);
 
-  // 3. On-chain ownership transfer
-  const transfer = await transferOwnership({
-    commitmentId: listing.commitmentId,
-    fromAddress: listing.sellerAddress,
-    toAddress: buyerAddress,
-  });
+    const auth = verifyAuth(req);
 
-  // 4. Audit log
-  await appendAuditEvent({
-    category: 'marketplace',
-    action: 'marketplace.purchase',
-    severity: 'info',
-    actor: buyerAddress,
-    resourceId: listingId,
-    metadata: {
-      listingId,
-      commitmentId: listing.commitmentId,
-      price: listing.price,
-      currencyAsset: listing.currencyAsset,
-      txHash: transfer.txHash,
-      reference: transfer.reference,
-    },
-  });
+    const ip = getClientIp(req);
+    if (!(await checkRateLimit(ip, 'api/marketplace/listings/purchase'))) {
+      throw new TooManyRequestsError(
+        'Too many requests. Please try again later.',
+        undefined,
+        getRateLimitWindowSeconds('api/marketplace/listings/purchase'),
+      );
+    }
 
-  return ok({
-    listingId,
-    commitmentId: listing.commitmentId,
-    buyerAddress,
-    price: listing.price,
-    currencyAsset: listing.currencyAsset,
-    txHash: transfer.txHash,
-    reference: transfer.reference,
-  });
-});
+    const id = parseMarketplaceListingId(params.id);
+
+    let body: unknown;
+    try {
+      body = await req.json();
+    } catch {
+      throw new ValidationError('Invalid JSON in request body');
+    }
+
+    const validation = MarketplacePurchaseBoundarySchema.safeParse(body);
+    if (!validation.success) {
+      throw new ValidationError('Invalid request data', validation.error.issues);
+    }
+
+    const buyerAddress = validation.data.buyerAddress;
+    assertWalletMatchesSession(auth.address, buyerAddress, 'buyerAddress');
+
+    const idempotencyKey = req.headers.get('idempotency-key');
+    if (idempotencyKey) {
+      const record = await idempotencyService.getRecord(idempotencyKey);
+      if (record) {
+        if (record.status === 'COMPLETED') {
+          return ok(record.response, undefined, record.statusCode, correlationId);
+        }
+        if (record.status === 'STARTED') {
+          throw new ConflictError('A request with this Idempotency-Key is currently processing');
+        }
+      }
+      await idempotencyService.start(idempotencyKey);
+    }
+
+    try {
+      const listing = await marketplaceService.getListing(id);
+      if (!listing) {
+        throw new NotFoundError('Listing', { listingId: id });
+      }
+
+      if (listing.status !== 'Active') {
+        throw new ConflictError('Only active listings can be purchased', {
+          listingId: id,
+          currentStatus: listing.status,
+        });
+      }
+
+      if (listing.sellerAddress === buyerAddress) {
+        throw new ForbiddenError('Cannot purchase your own listing', {
+          listingId: id,
+        });
+      }
+
+      const commitmentId = listing.commitmentId;
+      const fromAddress = listing.sellerAddress;
+      const toAddress = buyerAddress;
+
+      const transfer = await transferOwnership({ commitmentId, fromAddress, toAddress });
+      const purchasedListing = await marketplaceService.completePurchase(id, buyerAddress);
+
+      const responseData = {
+        listingId: purchasedListing.id,
+        commitmentId,
+        buyerAddress,
+        sellerAddress: fromAddress,
+        txHash: transfer.txHash,
+        purchasedAt: purchasedListing.updatedAt,
+      };
+
+      if (idempotencyKey) {
+        await idempotencyService.complete(idempotencyKey, responseData, 200);
+      }
+
+      return ok(responseData, undefined, 200, correlationId);
+    } catch (error) {
+      if (idempotencyKey) {
+        await idempotencyService.fail(idempotencyKey);
+      }
+      throw error;
+    }
+  },
+  { cors: MARKETPLACE_PURCHASE_CORS_POLICY },
+);
+
+const _405 = methodNotAllowed(['POST']);
+export { _405 as GET, _405 as PUT, _405 as PATCH, _405 as DELETE };

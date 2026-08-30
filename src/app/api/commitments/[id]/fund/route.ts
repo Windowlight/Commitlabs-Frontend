@@ -45,7 +45,7 @@ import { diagnosticsService } from '@/lib/backend/diagnostics';
 import { randomUUID } from 'crypto';
 
 const FundRequestSchema = z.object({
-  callerAddress: z.string().optional(),
+  callerAddress: z.string().min(1, 'callerAddress is required'),
 });
 
 /**

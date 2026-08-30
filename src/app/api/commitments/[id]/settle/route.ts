@@ -41,6 +41,7 @@ import {
 import { getClientIp } from '@/lib/backend/getClientIp';
 import { getCommitmentFromChain, settleCommitmentOnChain } from '@/lib/backend/services/contracts';
 import { logCommitmentSettled } from '@/lib/backend/logger';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { checkRateLimit, getRateLimitWindowSeconds } from '@/lib/backend/rateLimit';
 import { withApiHandler } from '@/lib/backend/withApiHandler';
 import { idempotencyService } from '@/lib/backend/idempotency';
@@ -115,15 +116,17 @@ export const POST = withApiHandler(async (req: NextRequest, { params }, correlat
     // ─── Request Body Validation ──────────────────────────────────────────────
     let body: unknown;
     try {
-      body = await req.json();
-    } catch {
-      throw new ValidationError('Invalid JSON in request body');
-    }
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        throw new ValidationError('Invalid JSON in request body');
+      }
 
-    const validation = SettleRequestSchema.safeParse(body);
-    if (!validation.success) {
-      throw new ValidationError('Invalid request data', validation.error.issues);
-    }
+      const validation = SettleRequestSchema.safeParse(body);
+      if (!validation.success) {
+        throw new ValidationError('Invalid request data', validation.error.issues);
+      }
 
     // ─── Address Bounds Validation ────────────────────────────────────────────
     const callerAddress = validateAddressBounds(validation.data.callerAddress, 'callerAddress');
@@ -171,14 +174,14 @@ export const POST = withApiHandler(async (req: NextRequest, { params }, correlat
     // ─── Validate Transaction Response (Malformed Response Detection) ──────────
     validateTransactionResponse(settlementResult, 'settlement');
 
-    logCommitmentSettled({
-      ip,
-      commitmentId: id,
-      callerAddress,
-      settlementAmount: settlementResult.settlementAmount,
-      finalStatus: settlementResult.finalStatus,
-      txHash: settlementResult.txHash,
-    });
+      logCommitmentSettled({
+        ip,
+        commitmentId: id,
+        callerAddress,
+        settlementAmount: settlementResult.settlementAmount,
+        finalStatus: settlementResult.finalStatus,
+        txHash: settlementResult.txHash,
+      });
 
     const responseData = {
       commitmentId: id,
