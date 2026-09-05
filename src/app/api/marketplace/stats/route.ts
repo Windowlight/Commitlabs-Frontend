@@ -1,8 +1,6 @@
 /**
- * GET /api/marketplace/stats
- *
- * Returns aggregate statistics for the marketplace including active listings,
- * average yield, median price, and breakdown by commitment type.
+ * Validates an optional bearer token. If present, it must be a valid session
+ * token. If absent, the request is treated as unauthenticated public access.
  *
  * ## Caching & Freshness Strategy
  *
