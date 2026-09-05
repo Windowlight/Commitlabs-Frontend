@@ -41,6 +41,7 @@ import {
 import { getClientIp } from '@/lib/backend/getClientIp';
 import { getCommitmentFromChain, settleCommitmentOnChain } from '@/lib/backend/services/contracts';
 import { logCommitmentSettled } from '@/lib/backend/logger';
+import { idempotencyService } from '@/lib/backend/idempotency';
 import { checkRateLimit, getRateLimitWindowSeconds } from '@/lib/backend/rateLimit';
 import { withApiHandler } from '@/lib/backend/withApiHandler';
 import { idempotencyService } from '@/lib/backend/idempotency';
@@ -120,10 +121,36 @@ export const POST = withApiHandler(async (req: NextRequest, { params }, correlat
       throw new ValidationError('Invalid JSON in request body');
     }
 
-    const validation = SettleRequestSchema.safeParse(body);
-    if (!validation.success) {
-      throw new ValidationError('Invalid request data', validation.error.issues);
+    // ─── Idempotency Check & Protection ──────────────────────────────────────
+    const idempotencyKey = req.headers.get('idempotency-key');
+    if (idempotencyKey) {
+      const record = await idempotencyService.getRecord(idempotencyKey);
+      if (record) {
+        if (record.status === 'COMPLETED') {
+          diagnosticsService.completeOperation(operationId, 'success', undefined, {
+            cacheHit: true,
+            idempotent: true,
+          });
+          const response = ok(record.response, undefined, record.statusCode, correlationId);
+          response.headers.set('X-Idempotent-Replay', 'true');
+          return response;
+        } else if (record.status === 'STARTED') {
+          throw new ConflictError(
+            'A request with this Idempotency-Key is currently processing. Please retry after a brief delay.',
+          );
+        }
+      }
+      await idempotencyService.start(idempotencyKey);
     }
+    // ─── Request Body Validation ──────────────────────────────────────────────
+    let body: unknown;
+    try {
+      let body: unknown;
+      try {
+        body = await req.json();
+      } catch {
+        throw new ValidationError('Invalid JSON in request body');
+      }
 
     // ─── Address Bounds Validation ────────────────────────────────────────────
     const callerAddress = validateAddressBounds(validation.data.callerAddress, 'callerAddress');
@@ -132,6 +159,12 @@ export const POST = withApiHandler(async (req: NextRequest, { params }, correlat
     const commitment: any = await getCommitmentFromChain(id, { requestId: correlationId });
 
     if (!commitment) {
+      const error = createTransactionError(
+        'VALIDATION_ERROR' as any,
+        'Commitment not found',
+        transactionId,
+      );
+      stateMachine.transition('failed');
       throw new NotFoundError('Commitment', { commitmentId: id });
     }
 
@@ -157,6 +190,19 @@ export const POST = withApiHandler(async (req: NextRequest, { params }, correlat
         throw error;
       }
       throw new ForbiddenError('Ownership verification failed', { commitmentId: id });
+    }
+    if (
+      callerAddress &&
+      commitment.ownerAddress &&
+      callerAddress.toLowerCase() !== commitment.ownerAddress.toLowerCase()
+    ) {
+      const error = createTransactionError(
+        'VALIDATION_ERROR' as any,
+        'You do not own this commitment',
+        transactionId,
+      );
+      stateMachine.transition('failed');
+      throw new ForbiddenError('You do not own this commitment');
     }
 
     // ─── Execute Settlement on Chain ──────────────────────────────────────────

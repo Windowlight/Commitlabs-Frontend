@@ -30,11 +30,13 @@ import { ok, methodNotAllowed } from '@/lib/backend/apiResponse';
 import { assertMutationCsrf } from '@/lib/backend/csrf';
 import { createCorsOptionsHandler, type CorsRoutePolicy } from '@/lib/backend/cors';
 import {
+  BackendError,
   ConflictError,
   ForbiddenError,
   NotFoundError,
   TooManyRequestsError,
   ValidationError,
+  toBackendErrorResponse,
 } from '@/lib/backend/errors';
 import { getClientIp } from '@/lib/backend/getClientIp';
 import { fundEscrowOnChain, getCommitmentFromChain } from '@/lib/backend/services/contracts';
@@ -45,7 +47,7 @@ import { diagnosticsService } from '@/lib/backend/diagnostics';
 import { randomUUID } from 'crypto';
 
 const FundRequestSchema = z.object({
-  callerAddress: z.string().optional(),
+  callerAddress: z.string().min(1, 'callerAddress is required'),
 });
 
 /**
@@ -213,7 +215,7 @@ export const POST = withApiHandler(
         commitmentId: id,
         txHash: funded.txHash,
         reference: funded.reference,
-        fundedAt: new Date().toISOString(),
+        fundedAt,
       };
 
       if (idempotencyKey) {

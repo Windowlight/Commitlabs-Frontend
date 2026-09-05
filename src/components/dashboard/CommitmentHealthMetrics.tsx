@@ -1,101 +1,65 @@
 'use client';
 
-import React, { useState } from 'react';
-import { clsx, type ClassValue } from 'clsx';
-import { twMerge } from 'tailwind-merge';
-import { HealthMetricsComplianceChart } from './HealthMetricsComplianceChart';
-import { HealthMetricsDrawdownChart } from './HealthMetricsDrawdownChart';
-import { HealthMetricsValueHistoryChart } from './HealthMetricsValueHistoryChart';
-import { HealthMetricsFeeGenerationChart } from './HealthMetricsFeeGenerationChart';
-import { TrendingUp, TrendingDown, DollarSign, CheckCircle } from 'lucide-react';
-
-function cn(...inputs: ClassValue[]) {
-    return twMerge(clsx(inputs));
-}
-
-type TabType = 'value' | 'drawdown' | 'fee' | 'compliance';
-
-const tabIcons: Record<TabType, React.ReactNode> = {
-    value: <TrendingUp className="w-4 h-4" />,
-    drawdown: <TrendingDown className="w-4 h-4" />,
-    fee: <DollarSign className="w-4 h-4" />,
-    compliance: <CheckCircle className="w-4 h-4" />,
-};
+import React from 'react';
 
 interface CommitmentHealthMetricsProps {
-    complianceData: Array<{ date: string; complianceScore: number }>;
-    drawdownData: Array<{ date: string; drawdownPercent: number }>;
-    valueHistoryData: Array<{ date: string; currentValue: number; initialAmount?: number }>;
-    feeGenerationData: Array<{ date: string; feeAmount: number }>;
-    thresholdPercent?: number;
-    volatilityPercent?: number;
+  commitmentId: string;
+  complianceData: Array<{ date: string; complianceScore: number }>;
+  drawdownData: Array<{ date: string; drawdownPercent: number }>;
+  valueHistoryData: Array<{
+    date: string;
+    currentValue: number;
+    initialAmount: number;
+  }>;
+  feeGenerationData: Array<{ date: string; feeAmount: number }>;
+  exposure: unknown;
 }
 
+/** Renders compliance, drawdown, value, and fee charts for a commitment. */
 export default function CommitmentHealthMetrics({
-    complianceData,
-    drawdownData,
-    valueHistoryData,
-    feeGenerationData,
-    thresholdPercent,
-    volatilityPercent,
+  commitmentId,
+  complianceData,
+  drawdownData,
+  valueHistoryData,
+  feeGenerationData,
 }: CommitmentHealthMetricsProps) {
-    const [activeTab, setActiveTab] = useState<TabType>('value');
-
-    const tabs: { id: TabType; label: string }[] = [
-        { id: 'value', label: 'Value History' },
-        { id: 'drawdown', label: 'Drawdown' },
-        { id: 'fee', label: 'Fee Generation' },
-        { id: 'compliance', label: 'Compliance' },
-    ];
-
-    return (
-        <div className="w-full bg-[#0a0a0a] rounded-2xl p-6 border border-[#222]">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-8">
-                <h2 className="text-2xl font-semibold text-white">Health Metrics</h2>
-
-                <div className="flex flex-wrap gap-2 p-1 bg-[#111] rounded-lg border border-[#222]">
-                    {tabs.map((tab) => (
-                        <button
-                            key={tab.id}
-                            onClick={() => setActiveTab(tab.id)}
-                            className={cn(
-                                'flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-md transition-all duration-200',
-                                activeTab === tab.id
-                                    ? 'bg-[#222] text-[#0ff0fc] shadow-sm'
-                                    : 'text-[#666] hover:text-[#99a1af] hover:bg-[#1a1a1a]'
-                            )}
-                        >
-                            {tabIcons[tab.id]}
-                            {tab.label}
-                        </button>
-                    ))}
-                </div>
-            </div>
-
-            <div className="w-full">
-                {activeTab === 'value' && (
-                    <HealthMetricsValueHistoryChart 
-                        data={valueHistoryData} 
-                        volatilityPercent={volatilityPercent}
-                    />
-                )}
-                {activeTab === 'drawdown' && (
-                    <HealthMetricsDrawdownChart 
-                        data={drawdownData}
-                        thresholdPercent={thresholdPercent}
-                        volatilityPercent={volatilityPercent}
-                    />
-                )}
-                {activeTab === 'fee' && (
-                    <HealthMetricsFeeGenerationChart 
-                        data={feeGenerationData}
-                        volatilityPercent={volatilityPercent}
-                    />
-                )}
-                {activeTab === 'compliance' && (
-                    <HealthMetricsComplianceChart data={complianceData} />
-                )}
-            </div>
+  return (
+    <section aria-label="Commitment health metrics" data-commitment-id={commitmentId}>
+      <h2 className="text-white text-xl font-bold mb-4">Health Metrics</h2>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div className="bg-[#0a0a0a] rounded-xl p-4 border border-[#222]">
+          <h3 className="text-white/70 text-sm font-medium mb-2">Compliance</h3>
+          <div className="text-white text-2xl font-bold">
+            {complianceData.length > 0
+              ? `${complianceData[complianceData.length - 1].complianceScore}%`
+              : '—'}
+          </div>
         </div>
-    );
+        <div className="bg-[#0a0a0a] rounded-xl p-4 border border-[#222]">
+          <h3 className="text-white/70 text-sm font-medium mb-2">Drawdown</h3>
+          <div className="text-white text-2xl font-bold">
+            {drawdownData.length > 0
+              ? `${drawdownData[drawdownData.length - 1].drawdownPercent}%`
+              : '—'}
+          </div>
+        </div>
+        <div className="bg-[#0a0a0a] rounded-xl p-4 border border-[#222]">
+          <h3 className="text-white/70 text-sm font-medium mb-2">Value</h3>
+          <div className="text-white text-2xl font-bold">
+            {valueHistoryData.length > 0
+              ? `$${valueHistoryData[valueHistoryData.length - 1].currentValue.toLocaleString()}`
+              : '—'}
+          </div>
+        </div>
+        <div className="bg-[#0a0a0a] rounded-xl p-4 border border-[#222]">
+          <h3 className="text-white/70 text-sm font-medium mb-2">Fees Generated</h3>
+          <div className="text-white text-2xl font-bold">
+            {feeGenerationData.length > 0
+              ? `$${feeGenerationData[feeGenerationData.length - 1].feeAmount}`
+              : '—'}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
 }
